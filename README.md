@@ -183,12 +183,12 @@ A te mintáidon mért értékek (referencia):
 | 5 s-es klip | mézharmat ~3,0 s | **3,05–3,35 s, pontszám 424, erős** |
 | 12 s-es klip (homályos) | mézharmat ~8,8 s | **9,68–10,92 s, pontszám 653, erős** |
 | 41 s-es klip (tőzeglégy) | nincs mézharmat | 2 gyenge jelölés (246 és 124) |
-| 10 s-es klip (tőzeglégy + heves mozgás) | nincs mézharmat | **1 téves ERŐS jelölés (410)** |
+| 10 s-es klip (tőzeglégy + heves mozgás) | nincs mézharmat | **1 téves ERŐS jelölés (457)** |
 
 **Mindhárom valódi mézharmatot megtalálja** (424, 653, 875 pont).
 
 **Egy visszalépésről őszintén:** a követő javítása előtt a 10 s-es negatív minta
-349 pontot kapott (gyenge), most 410-et (erős). Az ok: az új követő itt valóban
+349 pontot kapott (gyenge), most 457-et (erős). Az ok: az új követő itt valóban
 elmozdul kb. 18 pixelt, mert a heves mozgásnál az állat megmozdul – ez helyes
 követés, de a háttérszámítást felkavarja, és felviszi a téves esemény pontszámát.
 Megvizsgáltam, hogy a folt elmozdulása alapján ki lehet-e szűrni: **nem**, mert
@@ -196,12 +196,13 @@ ez a téves folt épp a legkevésbé mozog (0,7 px, a valódi cseppek 3,9–6,3 
 
 Ennek gyakorlati következménye:
 
-- a határ most **410 és 424 között** van, ami szűk. Szűrésnek használd a
+- a határ most **457 és 424 között** van, ami szűk. Szűrésnek használd a
   pontszámot, de **minden erős találatot nézz meg a klipen** – a program
   előszűrő, nem végleges döntés.
 - ha nagyon zavar a téves riasztás, a **Szigorú** beállítás a mintáimon
-  mindkét negatívot kiszűrte, viszont a leghalványabb valódi cseppet is
-  elvesztette (424 → 357, azaz gyenge lett). Ez a kompromisszum.
+  mindkét negatívot kiszűrte (416 és 246→gyenge), viszont a leghalványabb
+  valódi cseppet is elvesztette (424 → 356, azaz gyenge lett). Ez a
+  kompromisszum, neked kell eldöntened, melyik zavar kevésbé.
 
 ---
 
@@ -287,6 +288,32 @@ ezért kell a kettőt együtt próbálni.
 a hasa helyett), vagy kimászik a képből és később visszatér máshogy. Ezekre nem a
 követő a válasz, hanem az **ellenőrzőpont** (2b. pont). Ezért is fontos, hogy a
 program most **kiírja a követés minőségét**, és figyelmeztet, ha bizonytalan volt.
+
+### Egy második hiba, amit közben találtam és javítottam
+
+Miután az első javítás élesben futott, kiderült, hogy **egy másik hibát hozott
+be**: ha a kabóca annyira megváltozott (elfordult, más fénybe került), hogy
+sehol a képen nem talált rá igazán meggyőző egyezést, a régi kód a
+**leggyengébb, még elfogadható találatot is elfogadta** — akár egy teljesen
+más, csak véletlenül hasonló textúrájú mozgó dologra is (másik rovar, levél).
+Onnantól a keret azt "követte", ezért úgy tűnt, mintha a program csak sima
+mozgást figyelne, nem kifejezetten a kabócát.
+
+Ezt bizonyítottam is: vettem egy **valódi másik rovar** (a negatív mintából a
+tőzeglegyet) képét, és megmértem, mennyire hasonlít a kabóca sablonjára — a
+program szemével nézve **0,67-es egyezést** ad, ami a régi szabály szerint
+simán elég volt az átugráshoz. Most a program **különbséget tesz a közeli és
+a távoli találat között**:
+
+- ha a keret **közel** (a legutóbbi helye körüli szűk sávban) talál valamit,
+  már egy közepes biztonságú egyezés (0,60) is elég — hiszen ott nem juthat
+  be véletlenül egy másik állat,
+- ha csak **távolabbi** (közepes vagy teljes képes) keresés talál valamit,
+  csak **nagyon meggyőző** (0,78 fölötti) egyezésnél mozdul oda a keret —
+  különben inkább a helyén marad, és bizonytalannak jelzi magát.
+
+Ezzel a csali-teszttel megmutatott hiba megszűnt, és a három valódi pozitív
+mintán a követés minősége is visszaállt (0,91 / 1,00 / 0,96).
 
 ---
 

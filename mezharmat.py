@@ -76,17 +76,28 @@ def ido(mp):
 
 
 # ------------------------------------------------------------------- koveto
-# A koveto beallitasai. A regi valtozat fo hibaja az volt, hogy amikor az
-# allat elugrott, a hatteren maradt keret is 0.55 koruli "egyezest" kapott,
-# ami atment a 0.38-as minimumon, igy a program megtalaltnak hitte magat es
-# soha nem indult el a nagy kereses. Ezert itt addig bovitjuk a keresest,
-# amig nincs MEGGYOZO egyezes, es a vegen a legjobb talalatot valasztjuk.
+# A koveto beallitasai. Ket kulon hiba miatt kellett ide ketszer visszanyulni.
+#
+# 1. hiba (regi kovetoben): amikor az allat elugrott, a hatteren maradt keret
+#    is 0.55 koruli egyezest kapott, es a program meg sem probalta a nagy
+#    keresest. Megoldas: addig bovitjuk a keresest (helyi - kozepes - teljes
+#    kep), amig nincs MEGGYOZO egyezes.
+#
+# 2. hiba (ezt most javitottuk): ha SEHOL a kepen nincs MEGGYOZO egyezes
+#    (pl. az allat elbujt vagy arnyekba ment), a regi kod meg a leggyengebb,
+#    MIN=0.38-nal jobb talalatot is elfogadta -- ez oda vezetett, hogy a
+#    keret ratapadt egy masik, csak veletlenul hasonlo texturaju mozgo
+#    dologra (mas rovar, level), es onnan mar azt kovette, mint egy sima
+#    mozgaserzekelo. Megoldas: a keret csak akkor mozdul, ha a talalat
+#    legalabb OK (0.60) eros; kulonben inkabb a helyen marad (bizonytalannak
+#    jelezzuk), mint hogy rossz helyre ugorjon.
 KOV = dict(
     HELYI_MARGO=55,        # elso kor: ekkora savban keres a legutobbi pozicio korul
     KOZEPES_MARGO=220,     # masodik kor
     MEGGYOZO=0.78,         # ennel jobb egyezes: nem kell tovabb keresni
-    OK=0.60,               # ez alatt "bizonytalan" a kovetes (jelezzuk)
-    MIN=0.38,              # ez alatt egyaltalan nem fogadjuk el
+    OK=0.60,               # ez alatt bizonytalan a kovetes -- ES ez alatt a
+                           # keret sem mozdul, inkabb a helyen marad
+    MIN=0.38,              # mar nem hasznalt elfogadasi kuszobkent, csak jelzesre
     BANK_MAX=3,
     BANK_KOZ=90,
     SKALAK=(0.80, 0.90, 1.11, 1.25),      # helyi keresesnel ezekkel is probal
@@ -203,6 +214,7 @@ class Koveto:
         kell_skala = self.utolso_pontszam < self.be["MEGGYOZO"]
 
         b, s = self._kereses(g32, self.be["HELYI_MARGO"], kell_skala)
+        kuszob = self.be["OK"]          # a szuk, kozeli keresesnel ez is eleg
         # Amig nincs meggyozo egyezes, bovitjuk a keresest. Ha az egyezes csak
         # "felenges" (OK es MEGGYOZO kozott), nem minden kepkockan bovitunk --
         # igy nem lassul le a feldolgozas, de a valodi elvesztest elkapjuk.
@@ -212,16 +224,23 @@ class Koveto:
                 b2, s2 = self._kereses(g32, self.be["KOZEPES_MARGO"], True)
                 if s2 > s:
                     b, s = b2, s2
+                    kuszob = self.be["MEGGYOZO"]   # tavoli talalat: szigorubb mertek kell
         if s < self.be["MEGGYOZO"] and self.elveszett % self.be["TELJES_KOZ"] == 0:
             b3, s3 = self._teljes_kep(gray, g32)
             if s3 > s:
                 b, s = b3, s3
+                kuszob = self.be["MEGGYOZO"]       # teljes kepes talalat: szigorubb mertek kell
 
         self.utolso_pontszam = s
         if s < self.be["OK"]:
             self.bizonytalan_kepkockak += 1
 
-        if b is not None and s >= self.be["MIN"]:
+        # Kozeli (szuk savos) korrekciohoz OK is eleg -- ott nem valik el
+        # tavoli, csak veletlenul hasonlo dolog. De ha a talalat a kozepes
+        # vagy teljes kepes keresesbol jott (tavolabbrol), csak MEGGYOZO
+        # egyezesnel fogadjuk el -- kulonben egy masik, csak felig hasonlo
+        # mozgo dolog (masik rovar, level) is ratudna venni a keretet.
+        if b is not None and s >= kuszob:
             self.x, self.y, self.w, self.h = b
             self.elveszett = 0
             if s >= self.be["MEGGYOZO"] and self.n % self.be["BANK_KOZ"] == 0:
