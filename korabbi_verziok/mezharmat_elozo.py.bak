@@ -1,0 +1,453 @@
+# -*- coding: utf-8 -*-
+"""
+Mezharmat-detektor kabocafelvetelekhez.
+=======================================
+
+Mit csinal?
+  1. Az elso kepkockan kijelolod a kabocat (egerrel).
+  2. A program sajat template-koveto algoritmussal vegig koveti az allatot
+     (NEM kell hozza opencv-contrib, sem KCF/CSRT/MOSSE tracker).
+  3. A kovetett test korul figyeli, mikor jelenik meg egy kicsi, tomor,
+     vilagos csepp, ami tobb kepkockan at egy helyben marad.
+  4. A gyanus idopontokat CSV-be irja, es minden esemenyrol
+     - kivag egy rovid ellenorzo videot,
+     - keszit egy kontakt-lapot (kepkocka-sorozat egy kepen).
+
+Hasznalat (parancssorbol, a mappaban allva):
+
+    py mezharmat.py --video "C:\\mezharmat_detektor\\videos\\teszt.mp4"
+    py mezharmat.py --mappa "C:\\mezharmat_detektor\\videos"
+    py mezharmat.py --video "...\\hosszu.mp4" --roi 686,402,181,128
+    py mezharmat.py --video "...\\hosszu.mp4" --tol 3600 --ig 7200
+
+Kapcsolok:
+    --video PATH    egyetlen videofajl
+    --mappa PATH    egy mappa osszes .mp4 fajlja
+    --kimenet PATH  eredmenymappa (alapertelmezes: <mappa>\\..\\output)
+    --roi x,y,w,h   ROI megadasa kezzel (nem ugrik fel ablak)
+    --tol / --ig    csak a videó adott masodperc-tartomanyat nezi
+    --erzekeny      erzekenyebb beallitas (tobb talalat, tobb teves riasztas)
+    --szigoru       szigorubb beallitas (kevesebb teves riasztas)
+    --nincs-klip    ne vagjon ki ellenorzo videokat
+"""
+
+import argparse
+import csv
+import os
+import sys
+from datetime import timedelta
+
+import cv2
+import numpy as np
+
+# ---------------------------------------------------------------- parameterek
+P = dict(
+    SEARCH_MARGIN=40,     # koveto keresesi savja px-ben
+    CTX_MARGIN=0.35,      # a kabocadoboz koruli extra sav aranya
+    BG_LEN=20,            # hattermodell hossza (kepkocka)
+    BRIGHT_DELTA=10.0,    # ennyivel legyen vilagosabb a hatternel a csepp
+    MIN_AREA=12,          # csepp legkisebb terulete (px)
+    MAX_AREA=400,         # csepp legnagyobb terulete (px)
+    MIN_FILL=0.65,        # tomorseg: terulet / befoglalo teglalap
+    MOTION_MAX=0.9,       # ennel hevesebb mozgas eseten a kepkocka kimarad
+    MAX_STEP=7.0,         # a csepp ennyit mozdulhat kepkockankent (px)
+    MIN_PERSIST=7,        # ennyi kepkockan at legyen jelen -> esemeny
+    MERGE_GAP_S=1.0,      # ennel kozelebbi esemenyek osszevonasa
+    MIN_SCORE=350.0,      # ez alatti pontszamu talalat "gyenge" jelolest kap
+)
+P_ALAP = dict(P)
+
+
+def beallit(mod):
+    P.update(P_ALAP)
+    if mod == "erzekeny":
+        P.update(BRIGHT_DELTA=7.0, MIN_PERSIST=5, MIN_FILL=0.55,
+                 MOTION_MAX=1.3, MIN_SCORE=200.0)
+    elif mod == "szigoru":
+        P.update(BRIGHT_DELTA=13.0, MIN_PERSIST=9, MIN_FILL=0.72,
+                 MOTION_MAX=0.7, MIN_SCORE=450.0)
+
+
+def ido(mp):
+    td = timedelta(seconds=float(mp))
+    t = int(td.total_seconds())
+    return "%02d:%02d:%02d.%03d" % (t // 3600, (t % 3600) // 60, t % 60,
+                                    int((mp - int(mp)) * 1000))
+
+
+# ------------------------------------------------------------------- koveto
+class TemplateKoveto:
+    """Template-matching alapu koveto. Csak alap OpenCV kell hozza."""
+
+    def __init__(self, gray, bbox):
+        x, y, w, h = [int(v) for v in bbox]
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.tpl = gray[y:y + h, x:x + w].astype(np.float32)
+        self.tpl0 = self.tpl.copy()          # eredeti minta az ujra-megtalalashoz
+        self.elveszett = 0
+
+    def _keres(self, gray, x0, y0, x1, y1, tpl):
+        win = gray[y0:y1, x0:x1].astype(np.float32)
+        if win.shape[0] < tpl.shape[0] or win.shape[1] < tpl.shape[1]:
+            return None, -1.0
+        r = cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, loc = cv2.minMaxLoc(r)
+        return (x0 + loc[0], y0 + loc[1]), float(mx)
+
+    def update(self, gray):
+        H, W = gray.shape
+        m = P["SEARCH_MARGIN"]
+        pos, sc = self._keres(gray,
+                              max(0, self.x - m), max(0, self.y - m),
+                              min(W, self.x + self.w + m), min(H, self.y + self.h + m),
+                              self.tpl)
+        if sc < 0.35:
+            self.elveszett += 1
+            # 20 sikertelen kepkocka utan az egesz kepen ujra keresunk
+            if self.elveszett % 20 == 0:
+                pos2, sc2 = self._keres(gray, 0, 0, W, H, self.tpl0)
+                if sc2 > 0.5:
+                    pos, sc = pos2, sc2
+                    self.tpl = self.tpl0.copy()
+                    self.elveszett = 0
+        else:
+            self.elveszett = 0
+
+        if pos is not None and sc >= 0.35:
+            self.x, self.y = pos
+            patch = gray[self.y:self.y + self.h, self.x:self.x + self.w].astype(np.float32)
+            if patch.shape == self.tpl.shape:
+                self.tpl = 0.97 * self.tpl + 0.03 * patch
+        return (self.x, self.y, self.w, self.h), sc
+
+
+def _kornyezet(bbox, shape):
+    x, y, w, h = bbox
+    mx, my = int(w * P["CTX_MARGIN"]), int(h * P["CTX_MARGIN"])
+    X, Y = max(0, x - mx), max(0, y - my)
+    X2, Y2 = min(shape[1], x + w + mx), min(shape[0], y + h + my)
+    return X, Y, X2 - X, Y2 - Y
+
+
+# ---------------------------------------------------------------- detektalas
+def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None):
+    """progress(frac 0..1, aktualis_masodperc), stop() -> True eseten megszakit."""
+    cap = cv2.VideoCapture(video)
+    if not cap.isOpened():
+        raise IOError("Nem nyithato meg: " + video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    ossz = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    kezdo = int((tol or 0) * fps)
+    vege = int(ig * fps) if ig else ossz
+    if kezdo:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, kezdo)
+
+    ok, frame = cap.read()
+    if not ok:
+        raise IOError("Ures video vagy rossz kezdopont.")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    kov = TemplateKoveto(gray, bbox)
+
+    bg, nyomok = [], []
+    dobozok = {}
+    prev = None
+    idx = kezdo
+    kihagyott = 0
+    elveszett_kepkockak = 0
+    cw = ch = None
+
+    while True:
+        ok, frame = cap.read()
+        if not ok or (vege and idx >= vege):
+            break
+        idx += 1
+        hatar = max(1, min(vege or ossz or idx, ossz or vege or idx))
+        if idx % 200 == 0:
+            if stop is not None and stop():
+                log("   Megszakitva a felhasznalo keresere.")
+                break
+            if progress is not None:
+                elt = max(1, hatar - kezdo)
+                progress(min(1.0, (idx - kezdo) / elt), idx / fps)
+        if ossz and idx % 3000 == 0:
+            log("   ... %s / %s (%.0f%%)" % (ido(idx / fps), ido(hatar / fps),
+                                             100.0 * (idx - kezdo) / max(1, hatar - kezdo)))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        box, sc = kov.update(gray)
+        if sc < 0.35:
+            elveszett_kepkockak += 1
+
+        dobozok[idx] = box
+        X, Y, W, H = _kornyezet(box, gray.shape)
+        if cw is None:
+            cw, ch = W, H
+        patch = gray[Y:Y + H, X:X + W]
+        if patch.shape[0] != ch or patch.shape[1] != cw:
+            if patch.size == 0:
+                continue
+            patch = cv2.resize(patch, (cw, ch))
+        patch = cv2.GaussianBlur(patch, (3, 3), 0).astype(np.float32)
+
+        motion = 0.0 if prev is None else float(np.abs(patch - prev).mean())
+        prev = patch
+
+        bg.append(patch)
+        if len(bg) > P["BG_LEN"]:
+            bg.pop(0)
+        if len(bg) < P["BG_LEN"]:
+            continue
+        if motion > P["MOTION_MAX"]:          # heves mozgas / zavaro rovar
+            kihagyott += 1
+            for t in nyomok:
+                t["closed"] = True
+            continue
+
+        hatter = np.median(np.stack(bg[:-3]), axis=0)
+        d = patch - hatter
+        mask = (d > P["BRIGHT_DELTA"]).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, lab, st, ce = cv2.connectedComponentsWithStats(mask, 8)
+
+        jeloltek = []
+        for i in range(1, n):
+            a = st[i, cv2.CC_STAT_AREA]
+            bw, bh = st[i, cv2.CC_STAT_WIDTH], st[i, cv2.CC_STAT_HEIGHT]
+            if not (P["MIN_AREA"] <= a <= P["MAX_AREA"]):
+                continue
+            if a / float(bw * bh) < P["MIN_FILL"]:
+                continue
+            jeloltek.append((ce[i][0], ce[i][1], a, float(d[lab == i].mean())))
+
+        hasznalt = set()
+        for t in nyomok:
+            if t["closed"]:
+                continue
+            best, bd = None, 1e9
+            for j, c in enumerate(jeloltek):
+                if j in hasznalt:
+                    continue
+                dist = float(np.hypot(c[0] - t["x"], c[1] - t["y"]))
+                if dist < bd:
+                    best, bd = j, dist
+            if best is not None and bd <= P["MAX_STEP"]:
+                c = jeloltek[best]
+                hasznalt.add(best)
+                t.update(x=c[0], y=c[1], last=idx, n=t["n"] + 1,
+                         area=max(t["area"], c[2]), inten=max(t["inten"], c[3]), miss=0)
+            else:
+                t["miss"] += 1
+                if t["miss"] > 2:
+                    t["closed"] = True
+        for j, c in enumerate(jeloltek):
+            if j not in hasznalt:
+                nyomok.append(dict(x=c[0], y=c[1], first=idx, last=idx, n=1,
+                                   miss=0, closed=False, area=c[2], inten=c[3]))
+    cap.release()
+
+    esemenyek = []
+    for t in nyomok:
+        if t["n"] >= P["MIN_PERSIST"]:
+            esemenyek.append(dict(start_s=t["first"] / fps, end_s=t["last"] / fps,
+                                  frames=t["n"], area=t["area"], intensity=t["inten"],
+                                  score=t["n"] * t["inten"],
+                                  box=dobozok.get(t["first"], tuple(bbox))))
+    esemenyek.sort(key=lambda e: e["start_s"])
+
+    ossze = []
+    for e in esemenyek:
+        if ossze and e["start_s"] - ossze[-1]["end_s"] < P["MERGE_GAP_S"]:
+            m = ossze[-1]
+            m["end_s"] = max(m["end_s"], e["end_s"])
+            for k in ("frames", "area", "intensity", "score"):
+                m[k] = max(m[k], e[k])
+            if e["score"] > m["score"]:
+                m["box"] = e["box"]
+        else:
+            ossze.append(dict(e))
+    for e in ossze:
+        e["megbizhatosag"] = "eros" if e["score"] >= P["MIN_SCORE"] else "gyenge"
+    return fps, ossze, dict(kihagyott=kihagyott, kovetes_elveszett=elveszett_kepkockak,
+                            feldolgozott=idx - kezdo)
+
+
+# ------------------------------------------------------------- ellenorzes
+def klip_es_kontaktlap(video, e, fps, kimenet, alap, sorszam, keszits_klipet=True):
+    t0 = max(0.0, e["start_s"] - 1.5)
+    t1 = e["end_s"] + 1.5
+    cap = cv2.VideoCapture(video)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(t0 * fps))
+
+    # nagyitott kivagas a kabocara (kontaktlaphoz es a klip sarkaba)
+    bx, by, bw, bh = e.get("box", (0, 0, 0, 0))
+    mx, my = int(bw * 0.5), int(bh * 0.5)
+
+    kepek, ir = [], None
+    klip_ut = os.path.join(kimenet, "%s_esemeny%02d.mp4" % (alap, sorszam))
+    minta = max(1, int((t1 - t0) * fps / 9))
+    i = 0
+    while True:
+        ok, fr = cap.read()
+        if not ok or (t0 + i / fps) > t1:
+            break
+        H, W = fr.shape[:2]
+        cx0, cy0 = max(0, bx - mx), max(0, by - my)
+        cx1, cy1 = min(W, bx + bw + mx), min(H, by + bh + my)
+        if i % minta == 0 and len(kepek) < 9:
+            c = fr[cy0:cy1, cx0:cx1].copy()
+            if c.size:
+                c = cv2.resize(c, (c.shape[1] * 3, c.shape[0] * 3), interpolation=cv2.INTER_CUBIC)
+                cv2.putText(c, "%.2fs" % (t0 + i / fps), (8, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                kepek.append(c)
+        if keszits_klipet:
+            if ir is None:
+                ir = cv2.VideoWriter(klip_ut, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+            cv2.rectangle(fr, (cx0, cy0), (cx1, cy1), (0, 0, 255), 2)
+            cv2.putText(fr, "%s" % ido(t0 + i / fps), (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            ir.write(fr)
+        i += 1
+    cap.release()
+    if ir is not None:
+        ir.release()
+    if len(kepek) >= 9:
+        h0, w0 = kepek[0].shape[:2]
+        kepek = [cv2.resize(k, (w0, h0)) for k in kepek]
+        sorok = [np.hstack(kepek[k * 3:(k + 1) * 3]) for k in range(3)]
+        cv2.imwrite(os.path.join(kimenet, "%s_esemeny%02d.jpg" % (alap, sorszam)),
+                    np.vstack(sorok))
+    return klip_ut if keszits_klipet else ""
+
+
+# ------------------------------------------------------------------- futtato
+CSV_MEZOK = ["video", "kezdet_mp", "veg_mp", "kezdet", "veg", "hossz_kepkocka",
+             "csepp_terulet", "fenyesseg", "pontszam", "megbizhatosag", "ellenorzo_klip"]
+
+
+def csv_ir(csv_ut, sorok):
+    with open(csv_ut, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_MEZOK, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(sorok)
+
+
+def roi_valaszt(video):
+    cap = cv2.VideoCapture(video)
+    ok, fr = cap.read()
+    cap.release()
+    if not ok:
+        raise IOError("Nem olvashato az elso kepkocka (serult vagy nem tamogatott fajl).")
+    print("Jelold ki a KABOCA TESTET egerrel, majd nyomj ENTER-t vagy SPACE-t.")
+    cv2.namedWindow("Jelold ki a kabocat", cv2.WINDOW_NORMAL)
+    bbox = cv2.selectROI("Jelold ki a kabocat", fr, showCrosshair=True, fromCenter=False)
+    cv2.destroyAllWindows()
+    if bbox[2] == 0 or bbox[3] == 0:
+        raise SystemExit("Nem jelöltél ki érvényes területet.")
+    return tuple(int(v) for v in bbox)
+
+
+def feldolgoz(video, kimenet, roi=None, tol=None, ig=None, klip=True,
+              log=print, progress=None, stop=None):
+    alap = os.path.splitext(os.path.basename(video))[0][:40]
+    print = log
+    print("\n=== %s" % os.path.basename(video))
+    if not os.path.isfile(video):
+        mappa = os.path.dirname(video) or "."
+        print("   HIBA: nincs ilyen fajl: %s" % video)
+        if os.path.isdir(mappa):
+            talalt = [f for f in sorted(os.listdir(mappa))
+                      if f.lower().endswith((".mp4", ".mov", ".avi", ".mkv"))]
+            if talalt:
+                print("   A(z) '%s' mappaban ezek a videok vannak:" % mappa)
+                for f in talalt:
+                    print("      %s" % f)
+                print("   Masold be a pontos nevet, vagy futtasd az egesz mappara:")
+                print('      py mezharmat.py --mappa "%s"' % mappa)
+            else:
+                print("   A(z) '%s' mappaban nincs videofajl." % mappa)
+        else:
+            print("   Ez a mappa sem letezik: %s" % mappa)
+        return []
+    bbox = roi or roi_valaszt(video)
+    print("   ROI: x=%d y=%d w=%d h=%d" % tuple(bbox))
+    fps, ev, info = elemez(video, bbox, tol, ig, log=log, progress=progress, stop=stop)
+    print("   Feldolgozott kepkocka: %d | kihagyva (heves mozgas): %d | kovetes gyenge: %d"
+          % (info["feldolgozott"], info["kihagyott"], info["kovetes_elveszett"]))
+    if not ev:
+        print("   Nem talaltam mezharmat-gyanus esemenyt.")
+    sorok = []
+    for k, e in enumerate(sorted(ev, key=lambda x: -x["score"]), 1):
+        print("   %d. %s - %s  pontszam=%.0f  (%s)"
+              % (k, ido(e["start_s"]), ido(e["end_s"]), e["score"], e["megbizhatosag"]))
+        klip_ut = klip_es_kontaktlap(video, e, fps, kimenet, alap, k, klip)
+        sorok.append(dict(video=os.path.basename(video),
+                          kezdet_mp=round(e["start_s"], 2), veg_mp=round(e["end_s"], 2),
+                          kezdet=ido(e["start_s"]), veg=ido(e["end_s"]),
+                          hossz_kepkocka=e["frames"], csepp_terulet=int(e["area"]),
+                          fenyesseg=round(e["intensity"], 1), pontszam=round(e["score"]),
+                          megbizhatosag=e["megbizhatosag"], ellenorzo_klip=os.path.basename(klip_ut)))
+        sorok[-1]["_klip"] = klip_ut
+        sorok[-1]["_kep"] = os.path.join(kimenet, "%s_esemeny%02d.jpg" % (alap, k))
+    return sorok
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video")
+    ap.add_argument("--mappa")
+    ap.add_argument("--kimenet")
+    ap.add_argument("--roi")
+    ap.add_argument("--tol", type=float)
+    ap.add_argument("--ig", type=float)
+    ap.add_argument("--erzekeny", action="store_true")
+    ap.add_argument("--szigoru", action="store_true")
+    ap.add_argument("--nincs-klip", dest="nincs_klip", action="store_true")
+    a = ap.parse_args()
+
+    if a.erzekeny:
+        beallit("erzekeny")
+    if a.szigoru:
+        beallit("szigoru")
+
+    if a.video:
+        videok = [a.video]
+        alapmappa = os.path.dirname(os.path.abspath(a.video))
+    elif a.mappa:
+        if not os.path.isdir(a.mappa):
+            raise SystemExit("Nincs ilyen mappa: %s" % a.mappa)
+        videok = [os.path.join(a.mappa, f) for f in sorted(os.listdir(a.mappa))
+                  if f.lower().endswith((".mp4", ".mov", ".avi", ".mkv"))]
+        if not videok:
+            raise SystemExit("Nincs videofajl ebben a mappaban: %s" % a.mappa)
+        print("Talalt videok (%d db):" % len(videok))
+        for v in videok:
+            print("   %s" % os.path.basename(v))
+        alapmappa = os.path.abspath(a.mappa)
+    else:
+        ap.error("Adj meg --video vagy --mappa kapcsolot.")
+
+    kimenet = a.kimenet or os.path.join(os.path.dirname(alapmappa), "output")
+    os.makedirs(kimenet, exist_ok=True)
+
+    roi = None
+    if a.roi:
+        roi = tuple(int(v) for v in a.roi.split(","))
+
+    mind = []
+    for v in videok:
+        try:
+            mind += feldolgoz(v, kimenet, roi, a.tol, a.ig, not a.nincs_klip)
+        except Exception as ex:
+            print("   HIBA: %s" % ex)
+
+    csv_ut = os.path.join(kimenet, "mezharmat_esemenyek.csv")
+    csv_ir(csv_ut, mind)
+    print("\nOsszes talalat: %d" % len(mind))
+    print("CSV: %s" % csv_ut)
+    print("Ellenorzo klipek es kontaktlapok ugyanitt: %s" % kimenet)
+
+
+if __name__ == "__main__":
+    main()
