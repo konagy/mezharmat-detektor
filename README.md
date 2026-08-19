@@ -43,12 +43,18 @@ A felület négy lépésre van osztva, felülről lefelé:
 Válaszd az **Egy videófájl** vagy az **Egy egész mappa** módot, majd **Tallózás**.
 Mappás módban sorra veszi az összes videót.
 
-### 2. Hol van a kabóca?
+### 2. Hol van a kabóca és a potrohvég?
 
-Kattints a **Kabóca kijelölése** gombra:
+Kattints a **Kabóca + potrohvég** gombra. Két kijelölés következik:
 
-- húzz téglalapot **a kabóca teste köré** (a potrohvég legyen benne),
-- nyomj **ENTER**-t vagy **SPACE**-t.
+1. húzz téglalapot **a kabóca teste köré**, majd nyomj **ENTER**-t vagy **SPACE**-t;
+2. jelöld ki **szűken a potrohvég és a közvetlenül mögötte lévő kis területet**,
+   ahol a csepp megjelenhet, majd nyomj ismét **ENTER**-t vagy **SPACE**-t.
+
+A második keretbe ne kerüljön bele újra az egész test, és lehetőleg kevés
+levélfelületet tartalmazzon. A program ezt a kis keresési zónát a kabóca
+követett helyzetével együtt mozgatja. Ez szűri ki a távoli levélcsillanások és
+a második rovar nagy részét.
 
 **Fontos újítás:** a kijelölés nem az első képkockán történik, hanem **annál a
 másodpercnél, ahol az elemzés kezdődik**. Ha tehát a 3. pontban a *Csak ettől (mp)*
@@ -166,43 +172,38 @@ A CSV oszlopai:
 - `hossz_kepkocka` – hány képkockán át látszott a csepp
 - `csepp_terulet` – a folt legnagyobb mérete pixelben
 - `fenyesseg` – mennyivel volt világosabb a háttérnél
+- `tomorseg` – a folt átlagos kitöltöttsége 0 és 1 között
+- `nyers_pontszam` – FPS-re normalizált hossz × fényesség
 - `kovetes_egyezes` – mennyire volt biztos a követés az esemény alatt (1,00 = teljesen
   biztos). Ha ez 0,60 alatti, a találat gyanús: lehet, hogy a keret nem is a kabócán volt.
-- `pontszam` – összesített erősség (hossz × fényesség)
+- `pontszam` – a nyers pontszám alak/tömörség alapján korrigált változata
 - `megbizhatosag` – `eros` vagy `gyenge`
 
 **Munkamenet javaslat:** először csak az **erős** sorokat nézd át a képeken.
 A gyenge sorok a bizonytalan esetek – ezeket érdemes átfutni, de itt lesz a
 legtöbb téves riasztás.
 
-A te mintáidon mért értékek (referencia):
+A rövid mintákon mért új referencia:
 
-| Minta | Valóság | Program eredménye |
+| Minta | Valóság | Új eredmény |
 |---|---|---|
-| 17 s-es klip | mézharmat ~11,8 s | **12,26–13,03 s, pontszám 875, erős** |
-| 5 s-es klip | mézharmat ~3,0 s | **3,05–3,35 s, pontszám 424, erős** |
-| 12 s-es klip (homályos) | mézharmat ~8,8 s | **9,68–10,92 s, pontszám 653, erős** |
-| 41 s-es klip (tőzeglégy) | nincs mézharmat | 2 gyenge jelölés (246 és 124) |
-| 10 s-es klip (tőzeglégy + heves mozgás) | nincs mézharmat | **1 téves ERŐS jelölés (457)** |
+| 17 s-es klip | mézharmat ~11,8 s | erős találat |
+| 5 s-es klip | mézharmat ~3,0 s | erős találat |
+| 12 s-es klip (homályos) | mézharmat ~8,8 s | erős találat |
+| 41 s-es klip (tőzeglégy) | nincs mézharmat | nincs erős találat |
+| 10 s-es klip (tőzeglégy + heves mozgás) | nincs mézharmat | nincs erős találat |
 
-**Mindhárom valódi mézharmatot megtalálja** (424, 653, 875 pont).
+Az új szabályok három fontos változást tartalmaznak:
 
-**Egy visszalépésről őszintén:** a követő javítása előtt a 10 s-es negatív minta
-349 pontot kapott (gyenge), most 457-et (erős). Az ok: az új követő itt valóban
-elmozdul kb. 18 pixelt, mert a heves mozgásnál az állat megmozdul – ez helyes
-követés, de a háttérszámítást felkavarja, és felviszi a téves esemény pontszámát.
-Megvizsgáltam, hogy a folt elmozdulása alapján ki lehet-e szűrni: **nem**, mert
-ez a téves folt épp a legkevésbé mozog (0,7 px, a valódi cseppek 3,9–6,3 px).
+- csak a külön kijelölt potrohvég-zónában keresnek;
+- két közeli időpontú foltot csak akkor vonnak össze, ha térben is ugyanazon a
+  helyen vannak – így a különböző levélcsillanások nem adódnak össze;
+- a pontszám figyelembe veszi a folt tömörségét, de a nagyon erős/hosszú,
+  homályos eseményeket nem dobja el.
 
-Ennek gyakorlati következménye:
-
-- a határ most **457 és 424 között** van, ami szűk. Szűrésnek használd a
-  pontszámot, de **minden erős találatot nézz meg a klipen** – a program
-  előszűrő, nem végleges döntés.
-- ha nagyon zavar a téves riasztás, a **Szigorú** beállítás a mintáimon
-  mindkét negatívot kiszűrte (416 és 246→gyenge), viszont a leghalványabb
-  valódi cseppet is elvesztette (424 → 356, azaz gyenge lett). Ez a
-  kompromisszum, neked kell eldöntened, melyik zavar kevésbé.
+Ez továbbra is kalibrációs eredmény öt rövid videón, nem független pontossági
+bizonyíték. A hosszú, korábban nem hangolt videókon külön validálni kell, és
+minden erős találatot érdemes az ellenőrző klipen megnézni.
 
 ---
 
@@ -224,7 +225,8 @@ A `mezharmat.py` fájl elején, a `P = dict(...)` blokkban:
 cd C:\mezharmat_detektor
 py mezharmat.py --mappa "C:\mezharmat_detektor\videos"
 py mezharmat.py --video "...\hosszu.mp4" --tol 0 --ig 3600
-py mezharmat.py --video "...\hosszu.mp4" --roi 686,402,181,128 --szigoru
+py mezharmat.py --video "...\hosszu.mp4" --roi 686,402,181,128 ^
+   --csepp-roi 630,405,105,120 --szigoru
 ```
 
 Ellenőrzőpontokkal és követés-ellenőrző videóval:
@@ -237,12 +239,19 @@ py mezharmat.py --video "...\hosszu.mp4" --tol 0 --ig 3600 ^
 py mezharmat.py --video "...\hosszu.mp4" --kovetes-video --roi 686,402,181,128
 ```
 
-Kapcsolók: `--video`, `--mappa`, `--kimenet`, `--roi x,y,w,h`, `--tol`, `--ig`,
+Kapcsolók: `--video`, `--mappa`, `--kimenet`, `--roi x,y,w,h`,
+`--csepp-roi x,y,w,h`, `--tol`, `--ig`,
 `--erzekeny`, `--szigoru`, `--nincs-klip`,
 `--ellenorzopont masodperc:x,y,w,h` (többször is megadható),
 `--kovetes-video` (csak ellenőrző videót készít), `--gyorsitas 6`.
 
 Ha rossz fájlnevet adsz meg, a program kilistázza, milyen videók vannak a mappában.
+
+Az öt rövid kalibrációs minta reprodukálható ellenőrzése fejlesztői környezetben:
+
+```
+py tools\benchmark_rovid_mintak.py D:\git\sources\short
+```
 
 ---
 

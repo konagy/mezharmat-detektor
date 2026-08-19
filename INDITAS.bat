@@ -11,7 +11,11 @@ py -c "import cv2" 2>nul
 if errorlevel 1 (
     echo Az OpenCV nincs telepitve. Most telepitem...
     py -m pip install --upgrade pip
-    py -m pip install opencv-python numpy
+    if exist requirements.txt (
+        py -m pip install -r requirements.txt
+    ) else (
+        py -m pip install opencv-python numpy
+    )
     if errorlevel 1 (
         echo.
         echo A telepites nem sikerult. Nezd meg a fenti hibat.

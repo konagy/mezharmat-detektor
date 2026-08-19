@@ -71,6 +71,7 @@ class App(tk.Tk):
         self.leallitas = threading.Event()
         self.szal = None
         self.roi = None
+        self.csepp_roi = None
         self.epontok = []            # [(masodperc, (x,y,w,h)), ...]
         self.talalatok = []
         self.kimenet_mappa = ""
@@ -113,10 +114,10 @@ class App(tk.Tk):
         # --- 2. kabóca kijelölése
         b2 = ttk.LabelFrame(kul, text=" 2. Hol van a kabóca? ", padding=10)
         b2.pack(fill="x", pady=(10, 0))
-        ttk.Label(b2, text="Jelöld ki a kabóca testét. A kijelölés annál a képkockánál\n"
-                           "történik, ahol az elemzés kezdődik (lásd 3. pont: Csak ettől).",
+        ttk.Label(b2, text="Jelöld ki a kabóca testét, majd külön a potrohvég körüli kis\n"
+                           "keresési területet. A kijelölés az elemzés kezdőképkockáján történik.",
                   justify="left").grid(row=0, column=0, sticky="w")
-        ttk.Button(b2, text="Kabóca kijelölése", width=20, command=self._roi_kijelol,
+        ttk.Button(b2, text="Kabóca + potrohvég", width=20, command=self._roi_kijelol,
                    style="Ind.TButton").grid(row=0, column=1, padx=(16, 0))
         self.roi_cimke = ttk.Label(b2, text="Még nincs kijelölve (mappás módban\n"
                                            "videónként fel fog ugrani az ablak).",
@@ -310,6 +311,31 @@ class App(tk.Tk):
             return None
         return tuple(int(v) for v in bbox)
 
+    def _csepp_kijelol_ablak(self, video, mp, test_bbox, cim):
+        """Szuk detektalasi terulet kijelolese a potrohveg mogott."""
+        try:
+            fr = mh.kepkocka(video, mp)
+        except Exception as ex:
+            messagebox.showerror("Hiba", str(ex))
+            return None
+        x, y, w, h = test_bbox
+        cv2.rectangle(fr, (x, y), (x + w, y + h), (0, 180, 0), 2)
+        messagebox.showinfo(
+            "Potrohvég kijelölése",
+            "Most jelöld ki SZŰKEN a potrohvég és a közvetlenül mögötte lévő\n"
+            "területet, ahol a mézharmatcsepp megjelenhet.\n\n"
+            "A zöld keret a kabóca teste. Ne jelöld ki újra az egész testet,\n"
+            "és lehetőleg kevés levélfelület kerüljön a piros keresési zónába.\n\n"
+            "A kijelölés után nyomj ENTER-t vagy SPACE-t.")
+        cv2.namedWindow(cim, cv2.WINDOW_NORMAL)
+        bbox = cv2.selectROI(cim, fr, showCrosshair=True, fromCenter=False)
+        cv2.destroyAllWindows()
+        for _ in range(4):
+            cv2.waitKey(1)
+        if bbox[2] < 5 or bbox[3] < 5:
+            return None
+        return tuple(int(v) for v in bbox)
+
     # ------------------------------------------------------ ellenorzopontok
     def _epont_lista_frissit(self):
         self.epont_lista.delete(0, "end")
@@ -356,10 +382,17 @@ class App(tk.Tk):
         if bbox is None:
             self.roi_torles_csendes()
             return
+        csepp_bbox = self._csepp_kijelol_ablak(
+            video, mp, bbox, "Jelold ki a potrohveg kornyeket - ENTER = kesz")
+        if csepp_bbox is None:
+            self.roi_torles_csendes()
+            return
         self.roi = bbox
+        self.csepp_roi = csepp_bbox
         self.roi_cimke.configure(
-            text="Kijelölve (%s): x=%d y=%d %dx%d"
-                 % (mh.ido(mp), bbox[0], bbox[1], bbox[2], bbox[3]),
+            text="Kijelölve (%s)\nTest: x=%d y=%d %dx%d | Potrohvég: x=%d y=%d %dx%d"
+                 % (mh.ido(mp), bbox[0], bbox[1], bbox[2], bbox[3],
+                    csepp_bbox[0], csepp_bbox[1], csepp_bbox[2], csepp_bbox[3]),
             foreground="#136d13")
 
     def _roi_torles(self):
@@ -367,6 +400,7 @@ class App(tk.Tk):
 
     def roi_torles_csendes(self):
         self.roi = None
+        self.csepp_roi = None
         self.roi_cimke.configure(text="Még nincs kijelölve (mappás módban\n"
                                       "videónként fel fog ugrani az ablak).",
                                  foreground="#8a6d00")
@@ -449,13 +483,16 @@ class App(tk.Tk):
                     break
                 self.uzenetek.put(("allapot", "%d/%d videó..." % (n, len(videok))))
                 roi = self.roi
+                csepp_roi = self.csepp_roi
                 if roi is None:
                     self.roi_kesz = threading.Event()
                     self.roi_valasz = None
+                    self.csepp_roi_valasz = None
                     self.uzenetek.put(("roi_keres", v))
                     self.roi_kesz.wait()
                     roi = self.roi_valasz
-                    if roi is None:
+                    csepp_roi = self.csepp_roi_valasz
+                    if roi is None or csepp_roi is None:
                         self._log("   Kihagyva (nem jelöltél ki területet).")
                         continue
 
@@ -467,7 +504,8 @@ class App(tk.Tk):
                 sorok = mh.feldolgoz(v, kimenet, roi, tol, ig, klip,
                                      log=self._log, progress=prog,
                                      stop=self.leallitas.is_set,
-                                     ellenorzopontok=self.epontok)
+                                     ellenorzopontok=self.epontok,
+                                     csepp_roi=csepp_roi)
                 mind += sorok
                 for s in sorok:
                     self.uzenetek.put(("talalat", s))
@@ -611,7 +649,24 @@ class App(tk.Tk):
                 for _ in range(4):
                     cv2.waitKey(1)
                 if b[2] >= 5 and b[3] >= 5:
-                    self.roi_valasz = tuple(int(v) for v in b)
+                    test_bbox = tuple(int(v) for v in b)
+                    x, y, w, h = test_bbox
+                    jelolt = fr.copy()
+                    cv2.rectangle(jelolt, (x, y), (x + w, y + h), (0, 180, 0), 2)
+                    messagebox.showinfo(
+                        "Potrohvég kijelölése",
+                        "Most szűken jelöld ki a potrohvég és a mögötte lévő\n"
+                        "kis területet. A zöld keret a kabóca teste.")
+                    cv2.namedWindow("Jelold ki a potrohveg kornyeket - ENTER = kesz",
+                                    cv2.WINDOW_NORMAL)
+                    c = cv2.selectROI("Jelold ki a potrohveg kornyeket - ENTER = kesz",
+                                      jelolt, showCrosshair=True, fromCenter=False)
+                    cv2.destroyAllWindows()
+                    for _ in range(4):
+                        cv2.waitKey(1)
+                    if c[2] >= 5 and c[3] >= 5:
+                        self.roi_valasz = test_bbox
+                        self.csepp_roi_valasz = tuple(int(v) for v in c)
         finally:
             self.roi_kesz.set()
 

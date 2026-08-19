@@ -42,6 +42,8 @@ import numpy as np
 
 # ---------------------------------------------------------------- parameterek
 P = dict(
+    REF_FPS=30.0,         # a regi kuszobok ehhez az FPS-hez voltak kalibralva
+    REF_FRAME_AREA=921600,  # 1280x720 px-es referencia-video
     SEARCH_MARGIN=40,     # koveto keresesi savja px-ben
     CTX_MARGIN=0.35,      # a kabocadoboz koruli extra sav aranya
     BG_LEN=20,            # hattermodell hossza (kepkocka)
@@ -53,6 +55,7 @@ P = dict(
     MAX_STEP=7.0,         # a csepp ennyit mozdulhat kepkockankent (px)
     MIN_PERSIST=7,        # ennyi kepkockan at legyen jelen -> esemeny
     MERGE_GAP_S=1.0,      # ennel kozelebbi esemenyek osszevonasa
+    SHAPE_BYPASS_SCORE=500.0,  # nagyon eros jel homalyosan is elfogadhato
     MIN_SCORE=350.0,      # ez alatti pontszamu talalat "gyenge" jelolest kap
 )
 P_ALAP = dict(P)
@@ -62,10 +65,10 @@ def beallit(mod):
     P.update(P_ALAP)
     if mod == "erzekeny":
         P.update(BRIGHT_DELTA=7.0, MIN_PERSIST=5, MIN_FILL=0.55,
-                 MOTION_MAX=1.3, MIN_SCORE=200.0)
+                 MOTION_MAX=1.3, SHAPE_BYPASS_SCORE=400.0, MIN_SCORE=200.0)
     elif mod == "szigoru":
         P.update(BRIGHT_DELTA=13.0, MIN_PERSIST=9, MIN_FILL=0.72,
-                 MOTION_MAX=0.7, MIN_SCORE=450.0)
+                 MOTION_MAX=0.7, SHAPE_BYPASS_SCORE=600.0, MIN_SCORE=450.0)
 
 
 def ido(mp):
@@ -283,9 +286,85 @@ def _kornyezet(bbox, shape):
     return X, Y, X2 - X, Y2 - Y
 
 
+def csepp_roi_relativ(test_bbox, csepp_roi):
+    """A csepp-ROI helye a kovetett testdobozhoz viszonyitva.
+
+    Az ertekek lehetnek a 0..1 tartomanyon kivul is, mert a csepp jellemzoen
+    kozvetlenul a testdobozon kivul jelenik meg.
+    """
+    x, y, w, h = [float(v) for v in test_bbox]
+    rx, ry, rw, rh = [float(v) for v in csepp_roi]
+    if w <= 0 or h <= 0 or rw <= 0 or rh <= 0:
+        raise ValueError("Ervenytelen test- vagy csepp-ROI.")
+    return ((rx - x) / w, (ry - y) / h, rw / w, rh / h)
+
+
+def _csepp_kornyezet(bbox, shape, relativ_roi):
+    """A testtel egyutt mozgo, kepre vagott detektalasi terulet."""
+    x, y, w, h = bbox
+    rx, ry, rw, rh = relativ_roi
+    X = int(round(x + rx * w))
+    Y = int(round(y + ry * h))
+    X2 = int(round(X + rw * w))
+    Y2 = int(round(Y + rh * h))
+    X, Y = max(0, X), max(0, Y)
+    X2, Y2 = min(shape[1], X2), min(shape[0], Y2)
+    return X, Y, max(0, X2 - X), max(0, Y2 - Y)
+
+
+def _futasi_kuszobok(fps, kepmeret):
+    """FPS- es felbontasfuggetlen kuszobok az aktualis videohoz."""
+    fps_arany = max(0.1, float(fps) / P["REF_FPS"])
+    kep_terulet = max(1.0, float(kepmeret[0]) * float(kepmeret[1]))
+    terulet_arany = kep_terulet / P["REF_FRAME_AREA"]
+    return dict(
+        bg_len=max(8, int(round(P["BG_LEN"] * fps_arany))),
+        min_area=max(4, int(round(P["MIN_AREA"] * terulet_arany))),
+        max_area=max(5, int(round(P["MAX_AREA"] * terulet_arany))),
+        max_step=max(2.0, P["MAX_STEP"] * np.sqrt(terulet_arany)),
+        min_persist=max(3, int(round(P["MIN_PERSIST"] * fps_arany))),
+        max_miss=max(1, int(round(2 * fps_arany))),
+    )
+
+
+def _esemeny_pontszam(frames, intensity, fill, fps):
+    """Ido- es alaktartast figyelembe vevo, 30 FPS-re normalizalt pontszam."""
+    nyers = float(frames) * float(intensity) * P["REF_FPS"] / max(1.0, float(fps))
+    tomorseg = min(1.0, max(0.0, float(fill)))
+    alak_pont = nyers * tomorseg * tomorseg
+    eros_jel_bonusz = max(0.0, nyers - P["SHAPE_BYPASS_SCORE"])
+    return nyers, alak_pont + eros_jel_bonusz
+
+
+def _esemenyek_osszevonasa(esemenyek, max_step):
+    """Idoben es terben ugyanahhoz a folthoz tarto szakaszok osszevonasa."""
+    ossze = []
+    for e in sorted(esemenyek, key=lambda x: x["start_s"]):
+        lehetseges = []
+        for m in ossze:
+            ido_res = e["start_s"] - m["end_s"]
+            tav = float(np.hypot(e["x"] - m["x"], e["y"] - m["y"]))
+            if ido_res < P["MERGE_GAP_S"] and tav <= 3.0 * max_step:
+                lehetseges.append((tav, m))
+        if not lehetseges:
+            ossze.append(dict(e))
+            continue
+
+        _, m = min(lehetseges, key=lambda x: x[0])
+        e_erosabb = e["score"] > m["score"]
+        m["end_s"] = max(m["end_s"], e["end_s"])
+        for k in ("frames", "area", "intensity", "raw_score", "score"):
+            m[k] = max(m[k], e[k])
+        m["kov_egyezes"] = min(m["kov_egyezes"], e["kov_egyezes"])
+        if e_erosabb:
+            for k in ("box", "fill", "korosseg", "oldalarany", "x", "y"):
+                m[k] = e[k]
+    return sorted(ossze, key=lambda x: x["start_s"])
+
+
 # ---------------------------------------------------------------- detektalas
 def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None,
-           ellenorzopontok=None):
+           ellenorzopontok=None, csepp_roi=None):
     """progress(frac 0..1, aktualis_masodperc), stop() -> True eseten megszakit.
 
     ellenorzopontok: [(masodperc, (x,y,w,h)), ...] -- ezeknel az idopontoknal a
@@ -297,6 +376,8 @@ def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None,
         raise IOError("Nem nyithato meg: " + video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     ossz = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    kepmeret = (cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    kuszob = _futasi_kuszobok(fps, kepmeret)
 
     kezdo = int((tol or 0) * fps)
     vege = int(ig * fps) if ig else ossz
@@ -308,6 +389,7 @@ def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None,
         raise IOError("Ures video vagy rossz kezdopont.")
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     kov = Koveto(gray, bbox)
+    csepp_rel = csepp_roi_relativ(bbox, csepp_roi) if csepp_roi is not None else None
 
     # ellenorzopontok kepkocka-szam szerint
     horgonyok = {}
@@ -359,7 +441,10 @@ def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None,
             elveszett_kepkockak += 1
 
         dobozok[idx] = box
-        X, Y, W, H = _kornyezet(box, gray.shape)
+        X, Y, W, H = (_csepp_kornyezet(box, gray.shape, csepp_rel)
+                      if csepp_rel is not None else _kornyezet(box, gray.shape))
+        if W < 5 or H < 5:
+            continue
         if cw is None:
             cw, ch = W, H
         patch = gray[Y:Y + H, X:X + W]
@@ -373,9 +458,9 @@ def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None,
         prev = patch
 
         bg.append(patch)
-        if len(bg) > P["BG_LEN"]:
+        if len(bg) > kuszob["bg_len"]:
             bg.pop(0)
-        if len(bg) < P["BG_LEN"]:
+        if len(bg) < kuszob["bg_len"]:
             continue
         if motion > P["MOTION_MAX"]:          # heves mozgas / zavaro rovar
             kihagyott += 1
@@ -393,11 +478,21 @@ def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None,
         for i in range(1, n):
             a = st[i, cv2.CC_STAT_AREA]
             bw, bh = st[i, cv2.CC_STAT_WIDTH], st[i, cv2.CC_STAT_HEIGHT]
-            if not (P["MIN_AREA"] <= a <= P["MAX_AREA"]):
+            if not (kuszob["min_area"] <= a <= kuszob["max_area"]):
                 continue
-            if a / float(bw * bh) < P["MIN_FILL"]:
+            fill = a / float(bw * bh)
+            if fill < P["MIN_FILL"]:
                 continue
-            jeloltek.append((ce[i][0], ce[i][1], a, float(d[lab == i].mean())))
+            sx, sy = st[i, cv2.CC_STAT_LEFT], st[i, cv2.CC_STAT_TOP]
+            komponens = (lab[sy:sy + bh, sx:sx + bw] == i).astype(np.uint8)
+            konturok, _ = cv2.findContours(komponens, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            kerulet = max((cv2.arcLength(k, True) for k in konturok), default=0.0)
+            korosseg = (4.0 * np.pi * a / (kerulet * kerulet)) if kerulet > 0 else 0.0
+            jeloltek.append(dict(x=float(ce[i][0]), y=float(ce[i][1]), area=int(a),
+                                 inten=float(d[lab == i].mean()), fill=float(fill),
+                                 korosseg=float(min(1.0, korosseg)),
+                                 oldalarany=float(min(bw, bh) / max(bw, bh))))
 
         hasznalt = set()
         for t in nyomok:
@@ -407,54 +502,55 @@ def elemez(video, bbox, tol=None, ig=None, log=print, progress=None, stop=None,
             for j, c in enumerate(jeloltek):
                 if j in hasznalt:
                     continue
-                dist = float(np.hypot(c[0] - t["x"], c[1] - t["y"]))
+                dist = float(np.hypot(c["x"] - t["x"], c["y"] - t["y"]))
                 if dist < bd:
                     best, bd = j, dist
-            if best is not None and bd <= P["MAX_STEP"]:
+            if best is not None and bd <= kuszob["max_step"]:
                 c = jeloltek[best]
                 hasznalt.add(best)
-                t["ut"] = t.get("ut", 0.0) + float(np.hypot(c[0] - t["x"], c[1] - t["y"]))
-                t.update(x=c[0], y=c[1], last=idx, n=t["n"] + 1,
-                         area=max(t["area"], c[2]), inten=max(t["inten"], c[3]), miss=0)
+                t["ut"] = t.get("ut", 0.0) + float(np.hypot(
+                    c["x"] - t["x"], c["y"] - t["y"]))
+                t.update(x=c["x"], y=c["y"], last=idx, n=t["n"] + 1,
+                         area=max(t["area"], c["area"]),
+                         inten=max(t["inten"], c["inten"]), miss=0,
+                         fill_sum=t["fill_sum"] + c["fill"],
+                         korosseg_sum=t["korosseg_sum"] + c["korosseg"],
+                         oldalarany_sum=t["oldalarany_sum"] + c["oldalarany"])
             else:
                 t["miss"] += 1
-                if t["miss"] > 2:
+                if t["miss"] > kuszob["max_miss"]:
                     t["closed"] = True
         for j, c in enumerate(jeloltek):
             if j not in hasznalt:
-                nyomok.append(dict(x=c[0], y=c[1], first=idx, last=idx, n=1,
-                                   miss=0, closed=False, area=c[2], inten=c[3],
-                                   x0=c[0], y0=c[1], ut=0.0))
+                nyomok.append(dict(x=c["x"], y=c["y"], first=idx, last=idx, n=1,
+                                   miss=0, closed=False, area=c["area"],
+                                   inten=c["inten"], x0=c["x"], y0=c["y"], ut=0.0,
+                                   fill_sum=c["fill"], korosseg_sum=c["korosseg"],
+                                   oldalarany_sum=c["oldalarany"]))
     cap.release()
 
     esemenyek = []
     for t in nyomok:
-        if t["n"] >= P["MIN_PERSIST"]:
+        if t["n"] >= kuszob["min_persist"]:
             elmozdulas = float(np.hypot(t["x"] - t.get("x0", t["x"]),
                                         t["y"] - t.get("y0", t["y"])))
+            fill_atlag = t["fill_sum"] / t["n"]
+            nyers_pontszam, pontszam = _esemeny_pontszam(
+                t["n"], t["inten"], fill_atlag, fps)
             esemenyek.append(dict(start_s=t["first"] / fps, end_s=t["last"] / fps,
                                   elmozdulas=elmozdulas, ut=t.get("ut", 0.0),
                                   frames=t["n"], area=t["area"], intensity=t["inten"],
-                                  score=t["n"] * t["inten"],
+                                  fill=fill_atlag,
+                                  korosseg=t["korosseg_sum"] / t["n"],
+                                  oldalarany=t["oldalarany_sum"] / t["n"],
+                                  x=t["x"], y=t["y"],
+                                  raw_score=nyers_pontszam, score=pontszam,
                                   box=dobozok.get(t["first"], tuple(bbox)),
                                   kov_egyezes=float(np.mean(
                                       [egyezesek.get(k, 1.0)
                                        for k in range(t["first"], t["last"] + 1)]
                                       or [1.0]))))
-    esemenyek.sort(key=lambda e: e["start_s"])
-
-    ossze = []
-    for e in esemenyek:
-        if ossze and e["start_s"] - ossze[-1]["end_s"] < P["MERGE_GAP_S"]:
-            m = ossze[-1]
-            m["end_s"] = max(m["end_s"], e["end_s"])
-            for k in ("frames", "area", "intensity", "score"):
-                m[k] = max(m[k], e[k])
-            m["kov_egyezes"] = min(m["kov_egyezes"], e["kov_egyezes"])
-            if e["score"] > m["score"]:
-                m["box"] = e["box"]
-        else:
-            ossze.append(dict(e))
+    ossze = _esemenyek_osszevonasa(esemenyek, kuszob["max_step"])
     for e in ossze:
         e["megbizhatosag"] = "eros" if e["score"] >= P["MIN_SCORE"] else "gyenge"
     fdb = max(1, idx - kezdo)
@@ -589,7 +685,8 @@ def kovetes_video(video, bbox, kimenet, tol=None, ig=None, ellenorzopontok=None,
 
 # ------------------------------------------------------------------- futtato
 CSV_MEZOK = ["video", "kezdet_mp", "veg_mp", "kezdet", "veg", "hossz_kepkocka",
-             "csepp_terulet", "fenyesseg", "pontszam", "megbizhatosag",
+             "csepp_terulet", "fenyesseg", "tomorseg", "nyers_pontszam",
+             "pontszam", "megbizhatosag",
              "kovetes_egyezes", "ellenorzo_klip"]
 
 
@@ -632,7 +729,8 @@ def roi_valaszt(video, idopont=0.0):
 
 
 def feldolgoz(video, kimenet, roi=None, tol=None, ig=None, klip=True,
-              log=print, progress=None, stop=None, ellenorzopontok=None):
+              log=print, progress=None, stop=None, ellenorzopontok=None,
+              csepp_roi=None):
     alap = os.path.splitext(os.path.basename(video))[0][:40]
     print = log
     print("\n=== %s" % os.path.basename(video))
@@ -658,7 +756,7 @@ def feldolgoz(video, kimenet, roi=None, tol=None, ig=None, klip=True,
     print("   ROI: x=%d y=%d w=%d h=%d  (kijeloles ideje: %s)"
           % (bbox[0], bbox[1], bbox[2], bbox[3], ido(tol or 0.0)))
     fps, ev, info = elemez(video, bbox, tol, ig, log=log, progress=progress, stop=stop,
-                           ellenorzopontok=ellenorzopontok)
+                           ellenorzopontok=ellenorzopontok, csepp_roi=csepp_roi)
     print("   Feldolgozott kepkocka: %d | kihagyva (heves mozgas): %d" %
           (info["feldolgozott"], info["kihagyott"]))
     biz = info["kovetes_bizonytalan_szazalek"]
@@ -683,7 +781,10 @@ def feldolgoz(video, kimenet, roi=None, tol=None, ig=None, klip=True,
                           kezdet_mp=round(e["start_s"], 2), veg_mp=round(e["end_s"], 2),
                           kezdet=ido(e["start_s"]), veg=ido(e["end_s"]),
                           hossz_kepkocka=e["frames"], csepp_terulet=int(e["area"]),
-                          fenyesseg=round(e["intensity"], 1), pontszam=round(e["score"]),
+                          fenyesseg=round(e["intensity"], 1),
+                          tomorseg=round(e.get("fill", 0.0), 3),
+                          nyers_pontszam=round(e.get("raw_score", e["score"])),
+                          pontszam=round(e["score"]),
                           megbizhatosag=e["megbizhatosag"],
                           kovetes_egyezes=round(e.get("kov_egyezes", 1.0), 2),
                           ellenorzo_klip=os.path.basename(klip_ut)))
@@ -698,6 +799,8 @@ def main():
     ap.add_argument("--mappa")
     ap.add_argument("--kimenet")
     ap.add_argument("--roi")
+    ap.add_argument("--csepp-roi", dest="csepp_roi",
+                    help="Kulon keresesi terulet a potrohveg korul: x,y,w,h")
     ap.add_argument("--tol", type=float)
     ap.add_argument("--ig", type=float)
     ap.add_argument("--erzekeny", action="store_true")
@@ -740,6 +843,14 @@ def main():
     roi = None
     if a.roi:
         roi = tuple(int(v) for v in a.roi.split(","))
+        if len(roi) != 4:
+            raise SystemExit("A --roi formaja: x,y,w,h")
+
+    csepp_roi = None
+    if a.csepp_roi:
+        csepp_roi = tuple(int(v) for v in a.csepp_roi.split(","))
+        if len(csepp_roi) != 4:
+            raise SystemExit("A --csepp-roi formaja: x,y,w,h")
 
     # ellenorzopontok beolvasasa:  masodperc:x,y,w,h
     epontok = []
@@ -763,7 +874,7 @@ def main():
     for v in videok:
         try:
             mind += feldolgoz(v, kimenet, roi, a.tol, a.ig, not a.nincs_klip,
-                              ellenorzopontok=epontok)
+                              ellenorzopontok=epontok, csepp_roi=csepp_roi)
         except Exception as ex:
             print("   HIBA: %s" % ex)
 
