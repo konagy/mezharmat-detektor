@@ -1,4 +1,12 @@
 __pycache__/
 *.pyc
+.venv*/
+.yolo-cache/
+Ultralytics/
+.pytest_cache/
+artifacts/
+.tools/
+v2/target/
+v2/vendor/*.jar
 output/
 videos/
